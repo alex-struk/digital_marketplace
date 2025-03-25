@@ -318,6 +318,321 @@ async function validateUser(user: User): Promise<Validation<User, string[]>> {
 2. **Request ID Tracking** - Each request has a unique ID for tracing and debugging
 3. **Efficient File Handling** - Files are streamed rather than loaded entirely into memory
 
+## Functional Core, Imperative Shell
+
+The server framework is heavily influenced by the "Functional Core, Imperative Shell" (FCIS) architectural pattern, as first described by Gary Bernhardt. This pattern separates systems into two distinct layers:
+
+### Functional Core
+
+The "functional core" consists of pure business logic with these characteristics:
+- **Pure Functions** - Functions that always return the same output for the same input without side effects
+- **Immutability** - Data is never mutated in-place; instead, new data structures are created with changes
+- **No Side Effects** - No I/O operations, database calls, network requests, or other external interactions
+- **Deterministic** - Behavior is predictable and reproducible, making testing straightforward
+
+In the Digital Marketplace, the functional core includes:
+
+#### 1. Validation Functions
+
+The server uses pure validation functions that take inputs and return validation results without side effects:
+
+```typescript
+// In shared/lib/validation/index.ts
+export function validateGenericString(
+  value: string,
+  name: string,
+  min = 1,
+  max = 100,
+  characters = "characters"
+): Validation<string> {
+  if (value.length < min || value.length > max) {
+    return invalid([
+      `${name} must be between ${min} and ${max} ${characters} long.`
+    ]);
+  } else {
+    return valid(value);
+  }
+}
+
+// In shared/lib/validation/organization.ts
+export function validateLegalName(raw: string): Validation<string> {
+  return validateGenericString(raw, "Legal Name");
+}
+```
+
+#### 2. Request Transformation
+
+Pure functions for transforming request data between different formats:
+
+```typescript
+// In back-end/lib/server/index.ts
+export function composeTransformRequest<RBA, RBB, RBC, Session>(
+  a: TransformRequest<RBA, RBB, Session>,
+  b: TransformRequest<RBB, RBC, Session>
+): TransformRequest<RBA, RBC, Session> {
+  return async (request) => {
+    const bodyA = await a(request);
+    return await b({
+      ...request,
+      body: bodyA
+    });
+  };
+}
+```
+
+#### 3. Response Mapping
+
+Functions that transform responses in a pure manner:
+
+```typescript
+export function mapRespond<ReqB, ResBA, ResBB, Session>(
+  respond: Respond<ReqB, ResBA, Session>,
+  fn: (response: Response<ResBA, Session>) => Response<ResBB, Session>
+): Respond<ReqB, ResBB, Session> {
+  return async (request) => {
+    const response = await respond(request);
+    return fn(response);
+  };
+}
+```
+
+#### 4. Domain Models and Types
+
+Immutable data types that represent the domain:
+
+```typescript
+export interface Request<Body, Session> {
+  readonly id: string;            // Unique request ID
+  readonly path: string;          // Request path
+  readonly headers: IncomingHttpHeaders;  // HTTP headers
+  readonly logger: DomainLogger;  // Request-specific logger
+  readonly method: ServerHttpMethod;  // HTTP method
+  readonly session: Session;      // User session
+  readonly params: Record<string, string>;  // Route parameters
+  readonly query: Record<string, string>;   // Query parameters
+  readonly body: Body;            // Request body
+}
+```
+
+### Imperative Shell
+
+The "imperative shell" is a thin layer surrounding the functional core that handles:
+- **Side Effects** - All I/O operations (file system, network, database)
+- **External Systems** - Interactions with third-party services and APIs
+- **State Management** - Maintaining and persisting application state
+- **Coordination** - Orchestrating the flow of data between the functional core and external world
+
+In this server framework, the imperative shell is primarily implemented through:
+
+#### 1. Express Adapter
+
+The Express adapter in `adapters.ts` is the primary imperative shell component, handling all HTTP-specific interactions:
+
+```typescript
+export function express<
+  ParsedReqBody,
+  ValidatedReqBody,
+  ReqBodyErrors,
+  HookState,
+  Session,
+  FileUploadMetaData
+>(): ExpressAdapter<...> {
+  return ({ router, sessionIdToSession, sessionToSessionId, ... }) => {
+    // Setup Express app - Imperative code
+    const app = expressLib();
+
+    // Add middleware - Imperative interactions with Express
+    app.use(bodyParser.json({ type: "application/json" }));
+    app.use(cookieParser(COOKIE_SECRET));
+    app.use(corsLib(corsOptionDelegate));
+
+    // Mount routes - Imperative registration of routes
+    router.forEach((route) => {
+      app.all(route.path, makeExpressRequestHandler(route));
+    });
+
+    return app;
+  };
+}
+```
+
+#### 2. Request Processing Flow
+
+The `makeExpressRequestHandler` function implements the imperative shell's coordination logic:
+
+```typescript
+function makeExpressRequestHandler(...): expressLib.RequestHandler {
+  return asyncHandler(async (expressReq, expressRes, next) => {
+    // Side effects: HTTP method checking
+    const method = parseServerHttpMethod(expressReq.method) || ServerHttpMethod.Any;
+    if (method !== route.method) {
+      next();
+      return;
+    }
+
+    // Side effects: Session management
+    const sessionId = parseSessionId(expressReq.signedCookies[SESSION_COOKIE_NAME]);
+    const session = await sessionIdToSession(sessionId);
+
+    // Side effects: Request body parsing
+    let body: ExpressRequestBodies<FileUploadMetaData> = makeJsonRequestBody(null);
+    if (...) {
+      body = makeJsonRequestBody(expressReq.body);
+    } else if (...) {
+      body = await parseMultipartRequest(..., expressReq);
+    }
+
+    // Create initial request object (immutable)
+    const initialRequest = {
+      id: requestId,
+      path: expressReq.path,
+      method, session, headers, /* ... */
+      body
+    };
+
+    // Execute core business logic (functional core)
+    const hookState = route.hook ? await route.hook.before(initialRequest) : null;
+    const parsedRequest = { ...initialRequest, body: await route.handler.parseRequestBody(initialRequest) };
+    const validatedRequest = { ...parsedRequest, body: await route.handler.validateRequestBody(parsedRequest) };
+    const response = await route.handler.respond(validatedRequest);
+
+    // Side effects: File cleanup
+    if (body.tag === "file" && existsSync(body.value.path)) {
+      unlinkSync(body.value.path);
+    }
+
+    // Side effects: After hook execution
+    if (route.hook && route.hook.after) {
+      await route.hook.after(hookState, validatedRequest, response);
+    }
+
+    // Side effects: HTTP response sending
+    respond(response, expressRes);
+  });
+}
+```
+
+#### 3. File Handling
+
+File operations are implemented in the imperative shell:
+
+```typescript
+// Parsing multipart requests with file uploads (side effects)
+async function parseMultipartRequest(
+  maxSize: number,
+  parseMetadata: (data: any) => FileUploadMetaData,
+  req: expressLib.Request
+): Promise<FileRequestBody<FileUploadMetaData>> {
+  return new Promise((resolve, reject) => {
+    // Side-effect: File system operations
+    const form = new multiparty.Form({
+      maxFilesSize: maxSize,
+      uploadDir: tmpdir()
+    });
+
+    form.parse(req, (err, fields, files) => {
+      // Handle file upload side effects
+      // ...
+    });
+  });
+}
+```
+
+### Benefits of FCIS in the Server Framework
+
+1. **Testability** - The functional core can be tested without mocks or complex setup
+2. **Reasoning** - The separation makes it easier to reason about system behavior
+3. **Maintainability** - Changes to business logic don't require changes to I/O handling
+4. **Robustness** - Errors in the imperative shell don't corrupt the functional core
+5. **Flexibility** - The framework can adapt to different HTTP libraries by changing only the shell
+
+### Implementation in the Server Framework
+
+The server framework implements the FCIS pattern through these mechanisms:
+
+#### Handler Pattern
+
+The `Handler` interface clearly separates parsing, validation, and response generation:
+
+```typescript
+export interface Handler<
+  IncomingReqBody,
+  ParsedReqBody,
+  ValidatedReqBody,
+  ReqBodyErrors,
+  ResBody,
+  Session
+> {
+  readonly parseRequestBody: ParseRequestBody<...>;  // Pure transformation function
+  readonly validateRequestBody: ValidateRequestBody<...>;  // Pure validation function
+  readonly respond: Respond<...>;  // May contain impure code when needed
+}
+```
+
+#### Example Route Implementation
+
+A complete example of a route handler showing the FCIS separation:
+
+```typescript
+// Handler with functional core validation logic
+const createUserHandler: Handler<JsonRequestBody, any, UserData, string[], JsonResponseBody<User>, Session> = {
+  // Pure function to parse request body
+  parseRequestBody: async (request) => {
+    if (request.body.tag === 'json') {
+      return request.body.value;
+    }
+    throw new Error('Invalid request body');
+  },
+
+  // Pure function to validate parsed data
+  validateRequestBody: async (request) => {
+    const body = request.body;
+    const errors: string[] = [];
+
+    if (!body.name) errors.push('Name is required');
+    if (!body.email) errors.push('Email is required');
+
+    if (errors.length > 0) {
+      return invalid(errors);
+    }
+
+    return valid({
+      name: body.name,
+      email: body.email
+    });
+  },
+
+  // Function that bridges functional core with imperative operations
+  respond: wrapRespond({
+    valid: async (request) => {
+      const userData = request.body;
+
+      // Side effect: Database operation (imperative shell)
+      const user = await db.users.create(userData);
+
+      // Pure response creation (functional core)
+      return {
+        code: 201,
+        headers: {},
+        session: request.session,
+        body: makeJsonResponseBody(user)
+      };
+    },
+    invalid: async (request) => {
+      // Pure error response creation (functional core)
+      return {
+        code: 400,
+        headers: {},
+        session: request.session,
+        body: makeJsonResponseBody({ errors: request.body })
+      };
+    }
+  })
+};
+```
+
+While not a perfect implementation of FCIS, the framework makes significant strides toward this ideal, creating a codebase that balances functional purity with practical imperative needs.
+
 ## Conclusion
 
 The server framework provides a robust, type-safe foundation for the Digital Marketplace backend. Its flexible design allows for easy extension with new routes and resources, while ensuring type safety throughout the request/response cycle. The use of Express as the underlying HTTP server combines the benefits of a popular, well-tested server with a custom framework tailored to the application's needs.
